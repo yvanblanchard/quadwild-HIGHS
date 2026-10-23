@@ -29,7 +29,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "qr_charts.h"
 #include "qr_parameters.h"
 
-#include <gurobi_c++.h>
+#include "qr_milp.h"
 
 #define ILP_FIND_SUBDIVISION -1
 #define ILP_IGNORE -2

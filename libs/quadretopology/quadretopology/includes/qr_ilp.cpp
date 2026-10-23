@@ -25,7 +25,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "qr_ilp.h"
 
-#include <gurobi_c++.h>
+#include "qr_milp.h"
 
 #define MIN_SUBDIVISION_VALUE 1
 #define FEASIBILITY_FIX_COST 1000000.0
@@ -33,25 +33,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 namespace QuadRetopology {
 namespace internal {
 
-class GurobiCallBack : public GRBCallback
-{
-    const std::vector<float>& times;
-    const std::vector<float>& gaps;
-    size_t index;
-public:
-    GurobiCallBack(const std::vector<float>& times, const std::vector<float>& gaps);
-protected:
-    void callback() override;
-};
-
 void getChartSubsideSum(
         const ChartData& chartData,
         const size_t& cId,
-        const std::vector<GRBVar>& vars,
+        const std::vector<MILPVar>& vars,
         const std::vector<bool>& isFixed,
         const std::vector<int>& ilpResults,
         const bool hardParityConstraint,
-        std::vector<GRBLinExpr>& chartSubsideSum);
+        std::vector<MILPLinExpr>& chartSubsideSum);
 
 void getChartSubsideSumResults(
         const ChartData& chartData,
@@ -59,11 +48,11 @@ void getChartSubsideSumResults(
         const std::vector<int>& results,
         std::vector<int>& chartSubsideSum);
 
-GRBQuadExpr getGurobiCostTermInteger(GRBModel& model, const ILPMethod& method, const GRBLinExpr& value);
-GRBQuadExpr getGurobiCostTermContinuous(GRBModel& model, const ILPMethod& method, const GRBLinExpr& value);
+MILPLinExpr getMILPCostTermInteger(MILPModel& model, const ILPMethod& method, const MILPLinExpr& value);
+MILPLinExpr getMILPCostTermContinuous(MILPModel& model, const ILPMethod& method, const MILPLinExpr& value);
 
-GRBLinExpr getGurobiAbsInteger(GRBModel& model, const GRBLinExpr& value);
-GRBLinExpr getGurobiAbsContinuous(GRBModel& model, const GRBLinExpr& value);
+MILPLinExpr getMILPAbsInteger(MILPModel& model, const MILPLinExpr& value);
+MILPLinExpr getMILPAbsContinuous(MILPModel& model, const MILPLinExpr& value);
 
 inline void solveILP(
         const ChartData& chartData,
@@ -114,27 +103,24 @@ inline void solveILP(
 
             result = ilpResults;
 
-            GRBEnv env = GRBEnv();
+            MILPModel model;
 
-            GRBModel model = GRBModel(env);
-
-            GurobiCallBack cb(callbackTimeLimit, callbackGapLimit);
             if (!callbackTimeLimit.empty() && !callbackGapLimit.empty() && callbackTimeLimit.size() == callbackGapLimit.size()) {
-                model.setCallback(&cb);
+                model.setEarlyStop(callbackTimeLimit, callbackGapLimit);
             }
 
-#ifdef GUROBI_NON_VERBOSE
-            model.set(GRB_IntParam_OutputFlag, 0);
+#if defined(MILP_NON_VERBOSE) || defined(GUROBI_NON_VERBOSE)
+            model.verbose = false;
 #endif
 
-            model.set(GRB_DoubleParam_TimeLimit, timeLimit);
-            model.set(GRB_DoubleParam_MIPGap, gapLimit);
+            model.timeLimit = timeLimit;
+            model.gapLimit = gapLimit;
 
             // Create variables
-            GRBQuadExpr obj = 0;
-            GRBQuadExpr supportObj = 0;
+            MILPLinExpr obj = 0;
+            MILPLinExpr supportObj = 0;
 
-            vector<GRBVar> vars(chartData.subsides.size());
+            vector<MILPVar> vars(chartData.subsides.size());
 
             size_t constraintRespectedId = 0;
 
@@ -147,15 +133,28 @@ inline void solveILP(
 
                 //If it is not a border (free)
                 if (!isFixed[subsideId]) {
-                    vars[subsideId] = model.addVar(MIN_SUBDIVISION_VALUE, GRB_INFINITY, 0.0, GRB_INTEGER, "s" + to_string(subsideId));
+                    vars[subsideId] = model.addVar(MIN_SUBDIVISION_VALUE, MILP_INFINITY, true);
+
+                    //MIP start: (even) subdivision closest to the isometric one
+                    const int startChartId = subside.incidentCharts[0] >= 0 ? subside.incidentCharts[0] : subside.incidentCharts[1];
+                    if (startChartId >= 0) {
+                        const double sideSubdivision = subside.length / chartEdgeLength[startChartId];
+                        if (!hardParityConstraint) {
+                            model.setStart(vars[subsideId], std::max(static_cast<double>(MIN_SUBDIVISION_VALUE), std::round(sideSubdivision / 2.0)));
+                        }
+                        else {
+                            model.setStart(vars[subsideId], std::max(2.0, 2.0 * std::round(sideSubdivision / 2.0)));
+                        }
+                    }
                 }
                 else if (feasibilityFix && subside.isOnBorder) {
                     const int fixedSize = hardParityConstraint ? ilpResults[subsideId] : std::round(ilpResults[subsideId] / 2.0);
 
-                    vars[subsideId] = model.addVar(std::max(fixedSize - 1, MIN_SUBDIVISION_VALUE), fixedSize + 1, 0.0, GRB_INTEGER, "s" + to_string(subsideId));
-                    GRBLinExpr value = vars[subsideId] - fixedSize;
+                    vars[subsideId] = model.addVar(std::max(fixedSize - 1, MIN_SUBDIVISION_VALUE), fixedSize + 1, true);
+                    model.setStart(vars[subsideId], fixedSize);
+                    MILPLinExpr value = vars[subsideId] - fixedSize;
 
-                    supportObj += getGurobiAbsInteger(model, value) * FEASIBILITY_FIX_COST * (1.0 / fixedSize);
+                    supportObj += getMILPAbsInteger(model, value) * FEASIBILITY_FIX_COST * (1.0 / fixedSize);
 
                     isFixed[subsideId] = false;
                 }
@@ -181,8 +180,8 @@ inline void solveILP(
                     size_t numRegularityTerms = 0;
                     size_t numIsometryTerms = 0;
 
-                    GRBQuadExpr regExpr = 0;
-                    GRBQuadExpr isoExpr = 0;
+                    MILPLinExpr regExpr = 0;
+                    MILPLinExpr isoExpr = 0;
 
                     /* ------------------------ ISOMETRY ------------------------ */
 
@@ -202,9 +201,9 @@ inline void solveILP(
 
                                 sideSubdivision = std::max(static_cast<double>(MIN_SUBDIVISION_VALUE), sideSubdivision);
 
-                                GRBLinExpr value = vars[subsideId] - sideSubdivision;
+                                MILPLinExpr value = vars[subsideId] - sideSubdivision;
 
-                                isoExpr += getGurobiCostTermContinuous(model, method, value);
+                                isoExpr += getMILPCostTermContinuous(model, method, value);
                                 numIsometryTerms++;
                             }
                         }
@@ -213,28 +212,28 @@ inline void solveILP(
 
                     /* ------------------------ REGULARITY ------------------------ */
 
-                    std::vector<GRBLinExpr> chartSubsideSum;
+                    std::vector<MILPLinExpr> chartSubsideSum;
                     getChartSubsideSum(chartData, cId, vars, isFixed, ilpResults, hardParityConstraint, chartSubsideSum);
 
                     for (size_t j = 0; j < nSides; j++) {
-                        GRBLinExpr value = 0.0;
+                        MILPLinExpr value = 0.0;
                         bool valueComputed = false;
 
                         //Regularity for quad case
                         if (nSides == 4 && regularityQuadrilaterals) {
-                            const GRBLinExpr& subside0Sum = chartSubsideSum[j];
-                            const GRBLinExpr& subside2Sum = chartSubsideSum[(j+2)%nSides];
+                            const MILPLinExpr& subside0Sum = chartSubsideSum[j];
+                            const MILPLinExpr& subside2Sum = chartSubsideSum[(j+2)%nSides];
 
                             value = subside0Sum - subside2Sum;
                             valueComputed = true;
                         }
                         //Regularity for triangular case
                         else if (nSides == 3 && regularityNonQuadrilaterals) {
-                            const GRBLinExpr& subside0Sum = chartSubsideSum[j];
-                            const GRBLinExpr& subside1Sum = chartSubsideSum[(j+1)%nSides];
-                            const GRBLinExpr& subside2Sum = chartSubsideSum[(j+2)%nSides];
+                            const MILPLinExpr& subside0Sum = chartSubsideSum[j];
+                            const MILPLinExpr& subside1Sum = chartSubsideSum[(j+1)%nSides];
+                            const MILPLinExpr& subside2Sum = chartSubsideSum[(j+2)%nSides];
 
-                            GRBVar c = model.addVar(0, GRB_INFINITY, 0.0, GRB_INTEGER);
+                            MILPVar c = model.addVar(0, MILP_INFINITY, true);
                             model.addConstr(subside0Sum + 1 <= subside1Sum + subside2Sum + c);
 
                             value = c;
@@ -242,13 +241,13 @@ inline void solveILP(
                         }
                         //Regularity for pentagonal case
                         else if (nSides == 5 && regularityNonQuadrilaterals) {
-                            const GRBLinExpr& subside0Sum = chartSubsideSum[j];
-                            const GRBLinExpr& subside1Sum = chartSubsideSum[(j+1)%nSides];
-                            const GRBLinExpr& subside2Sum = chartSubsideSum[(j+2)%nSides];
-                            const GRBLinExpr& subside3Sum = chartSubsideSum[(j+3)%nSides];
-                            const GRBLinExpr& subside4Sum = chartSubsideSum[(j+4)%nSides];
+                            const MILPLinExpr& subside0Sum = chartSubsideSum[j];
+                            const MILPLinExpr& subside1Sum = chartSubsideSum[(j+1)%nSides];
+                            const MILPLinExpr& subside2Sum = chartSubsideSum[(j+2)%nSides];
+                            const MILPLinExpr& subside3Sum = chartSubsideSum[(j+3)%nSides];
+                            const MILPLinExpr& subside4Sum = chartSubsideSum[(j+4)%nSides];
 
-                            GRBVar c = model.addVar(0, GRB_INFINITY, 0.0, GRB_INTEGER);
+                            MILPVar c = model.addVar(0, MILP_INFINITY, true);
                             model.addConstr(subside0Sum + subside1Sum + 1 <= subside2Sum + subside3Sum + subside4Sum + c);
 
                             value = c;
@@ -256,16 +255,16 @@ inline void solveILP(
                         }
                         //Regularity for hexagonal case
                         else if (nSides == 6 && regularityNonQuadrilaterals) {
-                            const GRBLinExpr& subside0Sum = chartSubsideSum[j];
-                            const GRBLinExpr& subside2Sum = chartSubsideSum[(j+2)%nSides];
-                            const GRBLinExpr& subside4Sum = chartSubsideSum[(j+4)%nSides];
+                            const MILPLinExpr& subside0Sum = chartSubsideSum[j];
+                            const MILPLinExpr& subside2Sum = chartSubsideSum[(j+2)%nSides];
+                            const MILPLinExpr& subside4Sum = chartSubsideSum[(j+4)%nSides];
 
-                            GRBVar c = model.addVar(0, GRB_INFINITY, 0.0, GRB_INTEGER);
+                            MILPVar c = model.addVar(0, MILP_INFINITY, true);
                             model.addConstr(subside0Sum + 1 <= subside2Sum + subside4Sum + c);
 
-                            GRBLinExpr parityEquation = subside0Sum + subside2Sum + subside4Sum;
-                            GRBVar hexParity = model.addVar(3, GRB_INFINITY, 0.0, GRB_INTEGER);
-                            GRBVar hexFree = model.addVar(0, 1, 0.0, GRB_INTEGER);
+                            MILPLinExpr parityEquation = subside0Sum + subside2Sum + subside4Sum;
+                            MILPVar hexParity = model.addVar(3, MILP_INFINITY, true);
+                            MILPVar hexFree = model.addVar(0, 1, true);
                             model.addConstr(hexParity * 2 == parityEquation + hexFree);
 
                             value = (c + hexFree) / 2.0;
@@ -275,10 +274,10 @@ inline void solveILP(
                         if (valueComputed) {
                             if (constraintRespected.empty() || constraintRespected[constraintRespectedId]) {
                                 if (nSides == 4) {
-                                    regExpr += getGurobiCostTermInteger(model, ILPMethod::ABS, value) / nSides;
+                                    regExpr += getMILPCostTermInteger(model, ILPMethod::ABS, value) / nSides;
                                 }
                                 else {
-                                    regExpr += getGurobiCostTermInteger(model, ILPMethod::ABS, value) / nSides * regularityNonQuadrilateralsWeight;
+                                    regExpr += getMILPCostTermInteger(model, ILPMethod::ABS, value) / nSides * regularityNonQuadrilateralsWeight;
                                 }
 
                                 numRegularityTerms++;
@@ -295,8 +294,8 @@ inline void solveILP(
 
                     if (alignSingularities && (nSides == 3 || nSides == 5 || nSides == 6)) {
                         for (size_t j = 0; j < nSides; j++) {
-                            GRBLinExpr value1 = 0.0;
-                            GRBLinExpr value2 = 0.0;
+                            MILPLinExpr value1 = 0.0;
+                            MILPLinExpr value2 = 0.0;
 
                             int currentChartId = cId;
                             int currentChartSideId = j;
@@ -347,45 +346,45 @@ inline void solveILP(
                                 }
 
                                 if (currentComputable) {
-                                    GRBLinExpr valueDown1 = 0.0;
-                                    GRBLinExpr valueUp1 = 0.0;
-                                    GRBLinExpr valueDown2 = 0.0;
-                                    GRBLinExpr valueUp2 = 0.0;
+                                    MILPLinExpr valueDown1 = 0.0;
+                                    MILPLinExpr valueUp1 = 0.0;
+                                    MILPLinExpr valueDown2 = 0.0;
+                                    MILPLinExpr valueUp2 = 0.0;
 
                                     //Singularity alignment for triangular case
                                     if (nSides == 3) {
-                                        const GRBLinExpr& subside0Sum = chartSubsideSum[j];
-                                        const GRBLinExpr& subside1Sum = chartSubsideSum[(j+1)%nSides];
-                                        const GRBLinExpr& subside2Sum = chartSubsideSum[(j+2)%nSides];
+                                        const MILPLinExpr& subside0Sum = chartSubsideSum[j];
+                                        const MILPLinExpr& subside1Sum = chartSubsideSum[(j+1)%nSides];
+                                        const MILPLinExpr& subside2Sum = chartSubsideSum[(j+2)%nSides];
 
-                                        GRBLinExpr down = subside0Sum + subside2Sum - subside1Sum;
-                                        GRBLinExpr up = subside1Sum + subside0Sum - subside2Sum;
+                                        MILPLinExpr down = subside0Sum + subside2Sum - subside1Sum;
+                                        MILPLinExpr up = subside1Sum + subside0Sum - subside2Sum;
 
                                         valueDown1 = down;
                                         valueUp1 = up;
                                     }
                                     //Singularity alignment for pentagonal case
                                     else if (nSides == 5) {
-                                        const GRBLinExpr& subside0Sum = chartSubsideSum[j];
-                                        const GRBLinExpr& subside1Sum = chartSubsideSum[(j+1)%nSides];
-                                        const GRBLinExpr& subside2Sum = chartSubsideSum[(j+2)%nSides];
-                                        const GRBLinExpr& subside3Sum = chartSubsideSum[(j+3)%nSides];
-                                        const GRBLinExpr& subside4Sum = chartSubsideSum[(j+4)%nSides];
+                                        const MILPLinExpr& subside0Sum = chartSubsideSum[j];
+                                        const MILPLinExpr& subside1Sum = chartSubsideSum[(j+1)%nSides];
+                                        const MILPLinExpr& subside2Sum = chartSubsideSum[(j+2)%nSides];
+                                        const MILPLinExpr& subside3Sum = chartSubsideSum[(j+3)%nSides];
+                                        const MILPLinExpr& subside4Sum = chartSubsideSum[(j+4)%nSides];
 
-                                        GRBLinExpr down = (subside0Sum + subside1Sum + subside2Sum) - (subside3Sum + subside4Sum);
-                                        GRBLinExpr up = (subside3Sum + subside4Sum + subside0Sum) - (subside1Sum + subside2Sum);
+                                        MILPLinExpr down = (subside0Sum + subside1Sum + subside2Sum) - (subside3Sum + subside4Sum);
+                                        MILPLinExpr up = (subside3Sum + subside4Sum + subside0Sum) - (subside1Sum + subside2Sum);
 
                                         valueDown1 = down;
                                         valueUp1 = up;
                                     }
                                     //Singularity alignment for hexagonal case
                                     else if (nSides == 6) {
-                                        const GRBLinExpr& subside0Sum = chartSubsideSum[j];
-                                        const GRBLinExpr& subside2Sum = chartSubsideSum[(j+2)%nSides];
-                                        const GRBLinExpr& subside4Sum = chartSubsideSum[(j+4)%nSides];
+                                        const MILPLinExpr& subside0Sum = chartSubsideSum[j];
+                                        const MILPLinExpr& subside2Sum = chartSubsideSum[(j+2)%nSides];
+                                        const MILPLinExpr& subside4Sum = chartSubsideSum[(j+4)%nSides];
 
-                                        GRBLinExpr down = subside0Sum + subside2Sum - subside4Sum;
-                                        GRBLinExpr up = subside4Sum + subside0Sum - subside2Sum;
+                                        MILPLinExpr down = subside0Sum + subside2Sum - subside4Sum;
+                                        MILPLinExpr up = subside4Sum + subside0Sum - subside2Sum;
 
                                         valueDown1 = down;
                                         valueUp1 = up;
@@ -394,43 +393,43 @@ inline void solveILP(
 
 
 
-                                    std::vector<GRBLinExpr> adjChartSubsideSum;
+                                    std::vector<MILPLinExpr> adjChartSubsideSum;
                                     getChartSubsideSum(chartData, currentChartId, vars, isFixed, ilpResults, hardParityConstraint, adjChartSubsideSum);
 
                                     //Singularity alignment for triangular case
                                     if (currentChartNSides == 3) {
-                                        const GRBLinExpr& subside0Sum = adjChartSubsideSum[currentChartSideId];
-                                        const GRBLinExpr& subside1Sum = adjChartSubsideSum[(currentChartSideId+1)%currentChartNSides];
-                                        const GRBLinExpr& subside2Sum = adjChartSubsideSum[(currentChartSideId+2)%currentChartNSides];
+                                        const MILPLinExpr& subside0Sum = adjChartSubsideSum[currentChartSideId];
+                                        const MILPLinExpr& subside1Sum = adjChartSubsideSum[(currentChartSideId+1)%currentChartNSides];
+                                        const MILPLinExpr& subside2Sum = adjChartSubsideSum[(currentChartSideId+2)%currentChartNSides];
 
-                                        GRBLinExpr down = subside0Sum + subside2Sum - subside1Sum;
-                                        GRBLinExpr up = subside1Sum + subside0Sum - subside2Sum;
+                                        MILPLinExpr down = subside0Sum + subside2Sum - subside1Sum;
+                                        MILPLinExpr up = subside1Sum + subside0Sum - subside2Sum;
 
                                         valueDown2 = down;
                                         valueUp2 = up;
                                     }
                                     //Singularity alignment for pentagonal case
                                     else if (currentChartNSides == 5) {
-                                        const GRBLinExpr& subside0Sum = adjChartSubsideSum[currentChartSideId];
-                                        const GRBLinExpr& subside1Sum = adjChartSubsideSum[(currentChartSideId+1)%currentChartNSides];
-                                        const GRBLinExpr& subside2Sum = adjChartSubsideSum[(currentChartSideId+2)%currentChartNSides];
-                                        const GRBLinExpr& subside3Sum = adjChartSubsideSum[(currentChartSideId+3)%currentChartNSides];
-                                        const GRBLinExpr& subside4Sum = adjChartSubsideSum[(currentChartSideId+4)%currentChartNSides];
+                                        const MILPLinExpr& subside0Sum = adjChartSubsideSum[currentChartSideId];
+                                        const MILPLinExpr& subside1Sum = adjChartSubsideSum[(currentChartSideId+1)%currentChartNSides];
+                                        const MILPLinExpr& subside2Sum = adjChartSubsideSum[(currentChartSideId+2)%currentChartNSides];
+                                        const MILPLinExpr& subside3Sum = adjChartSubsideSum[(currentChartSideId+3)%currentChartNSides];
+                                        const MILPLinExpr& subside4Sum = adjChartSubsideSum[(currentChartSideId+4)%currentChartNSides];
 
-                                        GRBLinExpr down = (subside0Sum + subside1Sum + subside2Sum) - (subside3Sum + subside4Sum);
-                                        GRBLinExpr up = (subside3Sum + subside4Sum + subside0Sum) - (subside1Sum + subside2Sum);
+                                        MILPLinExpr down = (subside0Sum + subside1Sum + subside2Sum) - (subside3Sum + subside4Sum);
+                                        MILPLinExpr up = (subside3Sum + subside4Sum + subside0Sum) - (subside1Sum + subside2Sum);
 
                                         valueDown2 = down;
                                         valueUp2 = up;
                                     }
                                     //Singularity alignment for hexagonal case
                                     else if (currentChartNSides == 6) {
-                                        const GRBLinExpr& subside0Sum = adjChartSubsideSum[currentChartSideId];
-                                        const GRBLinExpr& subside2Sum = adjChartSubsideSum[(currentChartSideId+2)%currentChartNSides];
-                                        const GRBLinExpr& subside4Sum = adjChartSubsideSum[(currentChartSideId+4)%currentChartNSides];
+                                        const MILPLinExpr& subside0Sum = adjChartSubsideSum[currentChartSideId];
+                                        const MILPLinExpr& subside2Sum = adjChartSubsideSum[(currentChartSideId+2)%currentChartNSides];
+                                        const MILPLinExpr& subside4Sum = adjChartSubsideSum[(currentChartSideId+4)%currentChartNSides];
 
-                                        GRBLinExpr down = subside0Sum + subside2Sum - subside4Sum;
-                                        GRBLinExpr up = subside4Sum + subside0Sum - subside2Sum;
+                                        MILPLinExpr down = subside0Sum + subside2Sum - subside4Sum;
+                                        MILPLinExpr up = subside4Sum + subside0Sum - subside2Sum;
 
                                         valueDown2 = down;
                                         valueUp2 = up;
@@ -445,8 +444,8 @@ inline void solveILP(
                             if (valueComputed) {
                                 if (constraintRespected.empty() || constraintRespected[constraintRespectedId]) {
                                     regExpr += (
-                                        0.5 * getGurobiCostTermInteger(model, ILPMethod::ABS, value1) +
-                                        0.5 * getGurobiCostTermInteger(model, ILPMethod::ABS, value2)
+                                        0.5 * getMILPCostTermInteger(model, ILPMethod::ABS, value1) +
+                                        0.5 * getMILPCostTermInteger(model, ILPMethod::ABS, value2)
                                         )  / nSides * alignSingularitiesWeight;
                                 }
 
@@ -466,7 +465,7 @@ inline void solveILP(
 
                     //Even side size sum constraint in a chart
                     if (hardParityConstraint) {
-                        GRBLinExpr sumExp = 0;
+                        MILPLinExpr sumExp = 0;
                         for (const size_t& subsideId : chart.chartSubsides) {
                             const ChartSubside& subside = chartData.subsides[subsideId];
 
@@ -480,7 +479,7 @@ inline void solveILP(
                             }
                         }
 
-                        GRBVar free = model.addVar(2, GRB_INFINITY, 0.0, GRB_INTEGER);
+                        MILPVar free = model.addVar(2, MILP_INFINITY, true);
                         model.addConstr(free * 2 == sumExp);
                     }
 
@@ -495,7 +494,7 @@ inline void solveILP(
             }
 
             //Set objective function
-            model.setObjective(obj + supportObj, GRB_MINIMIZE);
+            model.setObjective(obj + supportObj);
 
             //model.write("out.lp");
 
@@ -507,7 +506,7 @@ inline void solveILP(
                 if (isComputable[subsideId]) {
                     if (!isFixed[subsideId]) {
                         assert(isComputable[subsideId] && !isFixed[subsideId]);
-                        result[subsideId] = static_cast<int>(std::round(vars[subsideId].get(GRB_DoubleAttr_X)));
+                        result[subsideId] = static_cast<int>(std::round(model.getValue(vars[subsideId])));
                     }
                     else {
                         const int fixedSize = hardParityConstraint ? ilpResults[subsideId] : std::round(ilpResults[subsideId] / 2.0);
@@ -788,15 +787,14 @@ inline void solveILP(
                 std::cout << "Lost contraints alignment: " << numLostConstraintsAlign << std::endl << std::endl << std::endl;
             }
 
-#ifndef GUROBI_NON_VERBOSE
-            cout << "Support obj: " << supportObj.getValue() << std::endl;
-            cout << "Obj: " << obj.getValue() << std::endl;
+#if !defined(MILP_NON_VERBOSE) && !defined(GUROBI_NON_VERBOSE)
+            cout << "Support obj: " << model.getValue(supportObj) << std::endl;
+            cout << "Obj: " << model.getValue(obj) << std::endl;
 #endif
-            gap = model.get(GRB_DoubleAttr_MIPGap);
+            gap = model.getMIPGap();
 
             status = ILPStatus::SOLUTIONFOUND;
 
-            model.reset();
 
 
             for (size_t cId = 0; cId < chartData.charts.size(); cId++) {
@@ -828,9 +826,8 @@ inline void solveILP(
                 }
             }
 
-        } catch(GRBException e) {
-            cout << "Error code = " << e.getErrorCode() << std::endl;
-            cout << e.getMessage() << std::endl;
+        } catch(const MILPException& e) {
+            cout << e.what() << std::endl;
 
             status = ILPStatus::INFEASIBLE;
         }
@@ -845,11 +842,11 @@ inline void solveILP(
 inline void getChartSubsideSum(
         const ChartData& chartData,
         const size_t& cId,
-        const std::vector<GRBVar>& vars,
+        const std::vector<MILPVar>& vars,
         const std::vector<bool>& isFixed,
         const std::vector<int>& ilpResults,
         const bool hardParityConstraint,
-        std::vector<GRBLinExpr>& chartSubsideSum)
+        std::vector<MILPLinExpr>& chartSubsideSum)
 {
     const Chart& chart = chartData.charts[cId];
 
@@ -859,7 +856,7 @@ inline void getChartSubsideSum(
 
     for (size_t i = 0; i < nSides; i++) {
         const ChartSide& side = chart.chartSides[i];
-        GRBLinExpr subsideSum = 0;
+        MILPLinExpr subsideSum = 0;
         for (const size_t& subsideId : side.subsides) {
             const ChartSubside& subside = chartData.subsides[subsideId];
 
@@ -900,90 +897,41 @@ inline void getChartSubsideSumResults(
     }
 }
 
-inline GRBQuadExpr getGurobiCostTermInteger(GRBModel& model, const ILPMethod& method, const GRBLinExpr& value)
+inline MILPLinExpr getMILPCostTermInteger(MILPModel& model, const ILPMethod& method, const MILPLinExpr& value)
 {
-    GRBQuadExpr expr;
+    MILPLinExpr expr;
 
     if (method == LEASTSQUARES) {
-        expr = value * value;
+        expr = model.addSquare(value);
     }
     else {
-        expr = getGurobiAbsInteger(model, value);
+        expr = getMILPAbsInteger(model, value);
     }
 
     return expr;
 }
 
-inline GRBQuadExpr getGurobiCostTermContinuous(GRBModel& model, const ILPMethod& method, const GRBLinExpr& value)
+inline MILPLinExpr getMILPCostTermContinuous(MILPModel& model, const ILPMethod& method, const MILPLinExpr& value)
 {
-    GRBQuadExpr expr;
+    MILPLinExpr expr;
 
     if (method == LEASTSQUARES) {
-        expr = value * value;
+        //value is (subdivision variable - constant): the square is exact at the integer values
+        expr = model.addSquare(value);
     }
     else {
-        expr = getGurobiAbsContinuous(model, value);
+        expr = getMILPAbsContinuous(model, value);
     }
 
     return expr;
 }
 
-inline GRBLinExpr getGurobiAbsInteger(GRBModel& model, const GRBLinExpr& value) {
-    GRBVar diff = model.addVar(-GRB_INFINITY, GRB_INFINITY, 0.0, GRB_INTEGER);
-    GRBVar abs = model.addVar(0, GRB_INFINITY, 0.0, GRB_INTEGER);
-    model.addConstr(diff == value);
-    model.addGenConstrAbs(abs, diff);
-
-    return abs;
+inline MILPLinExpr getMILPAbsInteger(MILPModel& model, const MILPLinExpr& value) {
+    return model.addAbs(value, true);
 }
 
-inline GRBLinExpr getGurobiAbsContinuous(GRBModel& model, const GRBLinExpr& value) {
-    GRBVar diff = model.addVar(-GRB_INFINITY, GRB_INFINITY, 0.0, GRB_CONTINUOUS);
-    GRBVar abs = model.addVar(0, GRB_INFINITY, 0.0, GRB_CONTINUOUS);
-    model.addConstr(diff == value);
-    model.addGenConstrAbs(abs, diff);
-
-    return abs;
-}
-
-inline GurobiCallBack::GurobiCallBack(const std::vector<float>& times, const std::vector<float>& gaps) :
-    times(times), gaps(gaps), index(0)
-{
-
-}
-
-inline void GurobiCallBack::callback() {
-    try {
-        GRBCallback::callback();
-
-        if (where == GRB_CB_MIP) {
-            const double runtime = getDoubleInfo(GRB_CB_RUNTIME);
-
-            while (index < times.size() && times[index] <= runtime) {
-                index++;
-            }
-
-            if (index > 0) {
-                const double objbst = getDoubleInfo(GRB_CB_MIP_OBJBST);
-                const double objbnd = getDoubleInfo(GRB_CB_MIP_OBJBND);
-
-                if (objbst == GRB_INFINITY)
-                    return;
-
-                const double currentGap = std::fabs(objbnd - objbst) / std::fabs(objbst);
-
-                if (currentGap < gaps[index - 1]) {
-                    std::cout << "Stop early - Gap: " << currentGap << " < " << gaps[index - 1] << " gap achieved after " << times[index - 1] << " seconds" << std::endl;
-                    abort();
-                }
-            }
-        }
-    } catch (GRBException e) {
-        std::cout << "Error number: " << e.getErrorCode() << std::endl;
-        std::cout << e.getMessage() << std::endl;
-    } catch (...) {
-        std::cout << "Error during callback" << std::endl;
-    }
+inline MILPLinExpr getMILPAbsContinuous(MILPModel& model, const MILPLinExpr& value) {
+    return model.addAbs(value, false);
 }
 
 }

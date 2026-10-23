@@ -19,6 +19,7 @@ struct Parameters {
         sharpAngle(35),
         alpha(0.02),
         scaleFact(1),
+        targetEdgeLength(0),
         hasFeature(false),
         hasField(false)
     {
@@ -29,6 +30,7 @@ struct Parameters {
     float sharpAngle;
     float alpha;
     float scaleFact;
+    float targetEdgeLength; //absolute quad edge length (model units); if > 0 it overrides scaleFact
     bool hasFeature;
     bool hasField;
 };

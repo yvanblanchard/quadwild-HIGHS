@@ -225,7 +225,9 @@ inline void quadrangulate(
     qParameters.quadrangulationNonFixedSmoothingIterations = 0; //Smoothing with fixed borders of the quadrangulation
     qParameters.feasibilityFix = false;
 
-    double edgeSize=avgEdge(trimeshToQuadrangulate)*scaleFactor;
+    double edgeSize=(parameters.targetEdgeLength>0) ?
+                parameters.targetEdgeLength :
+                avgEdge(trimeshToQuadrangulate)*scaleFactor;
     std::cout<<"Edge size: "<<edgeSize<<std::endl;
     const std::vector<double> edgeFactor(trimeshPartitions.size(), edgeSize);
 

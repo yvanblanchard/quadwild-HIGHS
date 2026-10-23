@@ -25,6 +25,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <iomanip>
 #include <clocale>
+#include <numeric> //std::accumulate in vcg isotropic_remeshing.h
 
 #include "functions.h"
 
